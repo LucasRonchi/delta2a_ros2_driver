@@ -24,6 +24,10 @@ class LidarNode(Node):
         self.period_try_reopen = self.get_parameter('period_try_reopen').value
 
         self.conn = None
+        self.num_points_scan = 240
+        self.ranges = [float('inf')] * self.num_points_scan
+        self.intensities = [0.0] * self.num_points_scan
+        self.last_angle_start = None
 
         self.try_reopen_serial = self.create_timer(
             timer_period_sec = self.period_try_reopen,
@@ -169,42 +173,87 @@ class LidarNode(Node):
                 frame_command = packet[5]
 
                 if frame_command == 0xAD:
-                    header = Header()
-                    header.stamp = self.get_clock().now().to_msg()
-                    header.frame_id = self.frame_id
 
-                    param_len = (packet[6] << 8) | packet[7]
+                    param_len = (
+                        (packet[6] << 8)
+                        | packet[7]
+                    )
+
                     frame_data = packet[8 : 8 + param_len]
-                    angle_start = ((frame_data[3] << 8) | frame_data[4]) * 0.01
+
+                    checksum_given = (
+                        (packet[8 + param_len] << 8)
+                        | packet[8 + param_len + 1]
+                    )
+
+                    checksum_calc = sum(packet[:8 + param_len]) & 0xFFFF
+
+                    if checksum_calc != checksum_given:
+                        continue
+
+                    angle_start = (
+                        (frame_data[3] << 8)
+                        | frame_data[4]
+                    ) * 0.01
+
                     num_points = (param_len - 9) // 3
 
-                    msg = LaserScan()
-                    msg.header = header
+                    start_index = int(angle_start / 1.5)
 
-                    msg.angle_increment = math.radians(1.5)
-                    msg.angle_min = math.radians(angle_start)
-                    msg.angle_max = msg.angle_min + msg.angle_increment * (num_points - 1)
+                    if (
+                        self.last_angle_start is not None and
+                        angle_start < self.last_angle_start
+                    ):
 
-                    msg.time_increment = 0.0
-                    msg.scan_time = 0.0
+                        msg = LaserScan()
 
-                    msg.range_min = 0.00025
-                    msg.range_max = 8.0
+                        msg.header.stamp = self.get_clock().now().to_msg()
+                        msg.header.frame_id = self.frame_id
 
-                    for offset in range(9, param_len - 2, 3):
+                        msg.angle_min = 0.0
+                        msg.angle_max = math.radians(358.5)
+                        msg.angle_increment = math.radians(1.5)
 
-                        distance = (
+                        msg.time_increment = 0.0
+                        msg.scan_time = 0.0
+
+                        msg.range_min = 0.05
+                        msg.range_max = 8.0
+
+                        msg.ranges = self.ranges.copy()
+                        msg.intensities = self.intensities.copy()
+
+                        self.scan_pub.publish(msg)
+
+                    self.last_angle_start = angle_start
+
+                    offset = 9
+
+                    for i in range(num_points):
+
+                        distance_raw = (
                             (frame_data[offset] << 8)
                             | frame_data[offset + 1]
-                        ) * 0.00025
+                        )
 
-                        quality = frame_data[offset + 2]
+                        distance = distance_raw * 0.00025
 
-                        msg.ranges.append(distance)
-                        msg.intensities.append(quality)
+                        quality = float(
+                            frame_data[offset + 2]
+                        )
 
-                    self.scan_pub.publish(msg)
+                        index = start_index + i
 
+                        if 0 <= index < self.num_points_scan:
+
+                            if distance > 0:
+                                self.ranges[index] = distance
+                            else:
+                                self.ranges[index] = float('inf')
+
+                            self.intensities[index] = quality
+
+                        offset += 3
 
     def destroy_node(self):
         self.get_logger().info('LidarNode is shutting down.')
